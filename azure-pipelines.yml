@@ -1,0 +1,284 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - feature/*
+      - release/*
+      - hotfix/*
+
+variables:
+  # Node version
+  nodeVersion: '18.x'
+  
+  # Environment-specific variables
+  - name: isDevelop
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/develop')]
+  - name: isMain
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+  
+  # Azure service connections
+  - name: devServiceConnection
+    value: 'taskify-dev-service-connection'
+  - name: stagingServiceConnection
+    value: 'taskify-staging-service-connection'
+  - name: prodServiceConnection
+    value: 'taskify-prod-service-connection'
+  
+  # App service names
+  - name: devAppService
+    value: 'taskify-dev'
+  - name: stagingAppService
+    value: 'taskify-staging'
+  - name: prodAppService
+    value: 'taskify-prod'
+
+stages:
+  - stage: Build
+    displayName: 'Build Stage'
+    jobs:
+      - job: BuildJob
+        displayName: 'Build Job'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: NodeTool@0
+            displayName: 'Install Node.js'
+            inputs:
+              versionSpec: $(nodeVersion)
+          
+          - task: Npm@1
+            displayName: 'npm install'
+            inputs:
+              command: 'install'
+          
+          - task: Npm@1
+            displayName: 'npm lint'
+            inputs:
+              command: 'custom'
+              customCommand: 'run lint'
+          
+          - task: Npm@1
+            displayName: 'npm build'
+            inputs:
+              command: 'custom'
+              customCommand: 'run build'
+          
+          - task: ArchiveFiles@2
+            displayName: 'Archive files'
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+              replaceExistingArchive: true
+              exclude: |
+                node_modules/**
+                tests/**
+                .git/**
+                .github/**
+                .vscode/**
+                coverage/**
+          
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish artifacts'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'drop'
+              publishLocation: 'Container'
+
+  - stage: Test
+    displayName: 'Test Stage'
+    dependsOn: Build
+    jobs:
+      - job: UnitTests
+        displayName: 'Unit Tests'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: NodeTool@0
+            displayName: 'Install Node.js'
+            inputs:
+              versionSpec: $(nodeVersion)
+          
+          - task: Npm@1
+            displayName: 'npm install'
+            inputs:
+              command: 'install'
+          
+          - task: Npm@1
+            displayName: 'Run unit tests'
+            inputs:
+              command: 'custom'
+              customCommand: 'run test:unit'
+          
+          - task: PublishTestResults@2
+            displayName: 'Publish unit test results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/junit-unit.xml'
+              mergeTestResults: true
+              testRunTitle: 'Unit Tests'
+            condition: succeededOrFailed()
+      
+      - job: IntegrationTests
+        displayName: 'Integration Tests'
+        pool:
+          vmImage: 'ubuntu-latest'
+        services:
+          postgres: postgres:13
+        steps:
+          - task: NodeTool@0
+            displayName: 'Install Node.js'
+            inputs:
+              versionSpec: $(nodeVersion)
+          
+          - task: Npm@1
+            displayName: 'npm install'
+            inputs:
+              command: 'install'
+          
+          - script: |
+              cp .env.example .env
+              sed -i 's/DB_HOST=localhost/DB_HOST=postgres/g' .env
+              sed -i 's/DB_PASSWORD=password/DB_PASSWORD=postgres/g' .env
+              npm run migrate
+            displayName: 'Setup test database'
+          
+          - task: Npm@1
+            displayName: 'Run integration tests'
+            inputs:
+              command: 'custom'
+              customCommand: 'run test:integration'
+            env:
+              DB_HOST: postgres
+              DB_USER: postgres
+              DB_PASSWORD: postgres
+              DB_NAME: postgres
+              JWT_SECRET: test_jwt_secret
+          
+          - task: PublishTestResults@2
+            displayName: 'Publish integration test results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/junit-integration.xml'
+              mergeTestResults: true
+              testRunTitle: 'Integration Tests'
+            condition: succeededOrFailed()
+
+  - stage: DeployToDev
+    displayName: 'Deploy to Development'
+    dependsOn: Test
+    condition: and(succeeded(), eq(variables.isDevelop, true))
+    jobs:
+      - deployment: DeployDev
+        displayName: 'Deploy to Dev Environment'
+        environment: 'development'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download artifacts'
+                  inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'drop'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+                
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to Azure Web App - Dev'
+                  inputs:
+                    azureSubscription: $(devServiceConnection)
+                    appType: 'webAppLinux'
+                    appName: $(devAppService)
+                    package: '$(System.ArtifactsDirectory)/drop/$(Build.BuildId).zip'
+                    startUpCommand: 'npm start'
+                    appSettings: |
+                      -NODE_ENV development
+                      -WEBSITE_NODE_DEFAULT_VERSION 18.x
+
+  - stage: DeployToStaging
+    displayName: 'Deploy to Staging'
+    dependsOn: Test
+    condition: and(succeeded(), eq(variables.isMain, true))
+    jobs:
+      - deployment: DeployStaging
+        displayName: 'Deploy to Staging Environment'
+        environment: 'staging'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download artifacts'
+                  inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'drop'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+                
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to Azure Web App - Staging'
+                  inputs:
+                    azureSubscription: $(stagingServiceConnection)
+                    appType: 'webAppLinux'
+                    appName: $(stagingAppService)
+                    deployToSlotOrASE: true
+                    resourceGroupName: 'taskify-rg'
+                    slotName: 'staging'
+                    package: '$(System.ArtifactsDirectory)/drop/$(Build.BuildId).zip'
+                    startUpCommand: 'npm start'
+                    appSettings: |
+                      -NODE_ENV staging
+                      -WEBSITE_NODE_DEFAULT_VERSION 18.x
+
+  - stage: DeployToProduction
+    displayName: 'Deploy to Production'
+    dependsOn: DeployToStaging
+    condition: succeeded()
+    jobs:
+      - deployment: DeployProd
+        displayName: 'Deploy to Production Environment'
+        environment: 'production'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download artifacts'
+                  inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'drop'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+                
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to Azure Web App - Production'
+                  inputs:
+                    azureSubscription: $(prodServiceConnection)
+                    appType: 'webAppLinux'
+                    appName: $(prodAppService)
+                    deployToSlotOrASE: true
+                    resourceGroupName: 'taskify-rg'
+                    slotName: 'staging'
+                    package: '$(System.ArtifactsDirectory)/drop/$(Build.BuildId).zip'
+                    startUpCommand: 'npm start'
+                    appSettings: |
+                      -NODE_ENV production
+                      -WEBSITE_NODE_DEFAULT_VERSION 18.x
+                
+                - task: AzureAppServiceManage@0
+                  displayName: 'Swap Slots - Production'
+                  inputs:
+                    azureSubscription: $(prodServiceConnection)
+                    WebAppName: $(prodAppService)
+                    ResourceGroupName: 'taskify-rg'
+                    SourceSlot: 'staging'
+                    SwapWithProduction: true 
